@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
+from werkzeug.utils import secure_filename
+from sqlalchemy import create_engine, text
 
 # Import analysis modules
 from analysis import DataAnalyzer, RootCauseAnalyzer
@@ -23,6 +25,26 @@ data_analyzer = None
 root_cause_analyzer = None
 correlation_detector = None
 anomaly_detector = None
+
+ALLOWED_EXTENSIONS = {'xlsx', 'xls'}
+
+engine = create_engine('sqlite:///data.db')
+
+# 允许的列
+REQUIRED_COLUMNS = [
+    'timestamp', 'production_line', 'machine_id', 'operator_id',
+    'temperature', 'pressure', 'vibration', 'quality_score',
+    'defect_count', 'ncr_type', 'severity', 'shift', 'material_batch'
+]
+
+# RAG 分级阈值
+RAG_THRESHOLDS = {
+    'defect_count': {'R': 5, 'A': 3}  # >5 红，>3 黄，<=3 绿
+}
+
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def load_data():
     """Load Excel data"""
@@ -49,9 +71,7 @@ def load_data():
                 continue
     
     if df is None:
-        # Create sample data
-        print("Data file not found, creating sample data...")
-        df = create_sample_data()
+       return None
     
     # Initialize analyzers
     data_analyzer = DataAnalyzer(df)
@@ -60,6 +80,18 @@ def load_data():
     anomaly_detector = AnomalyDetector(df)
     
     return df
+
+def serialize_anomalies(anomalies):
+    if isinstance(anomalies, pd.DataFrame):
+        return anomalies.applymap(lambda x: x.isoformat() if isinstance(x, (pd.Timestamp, datetime, time)) else x).to_dict(orient='records')
+    elif isinstance(anomalies, list):
+        def serialize_obj(obj):
+            if isinstance(obj, dict):
+                return {k: (v.isoformat() if isinstance(v, (pd.Timestamp, datetime, time)) else v) for k, v in obj.items()}
+            return obj
+        return [serialize_obj(a) for a in anomalies]
+    else:
+        return anomalies     
 
 def create_sample_data():
     """Create sample manufacturing data"""
@@ -90,6 +122,40 @@ def create_sample_data():
                                       (data['vibration'] > 60).astype(int) * 1)
     
     return pd.DataFrame(data)
+
+@app.route('/api/clear-data', methods=['POST'])
+def clear_data():
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM manufacturing_data"))
+        return jsonify({'status': 'success', 'message': 'All data cleared'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/upload-excel', methods=['POST'])
+def upload_excel():
+    file = request.files.get('file')
+    if not file:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    try:
+        df = pd.read_excel(file)
+
+        # 补全缺失列
+        for col in REQUIRED_COLUMNS:
+            if col not in df.columns:
+                df[col] = None
+
+        # 确保时间列为 datetime
+        if df['timestamp'].dtype != 'datetime64[ns]':
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+
+        # 存入 SQLite
+        df.to_sql('manufacturing_data', engine, if_exists='replace', index=False)
+
+        return jsonify({'status': 'success', 'rows': len(df)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500  
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -139,13 +205,13 @@ def get_correlations():
 
 @app.route('/api/analysis/anomalies', methods=['GET'])
 def get_anomalies():
-    """Get anomaly detection results"""
     if anomaly_detector is None:
         return jsonify({'error': 'Analyzer not initialized'}), 500
     
     limit = request.args.get('limit', 50, type=int)
     anomalies = anomaly_detector.detect_anomalies(limit)
-    return jsonify(anomalies)
+    anomalies_serializable = serialize_anomalies(anomalies)
+    return jsonify(anomalies_serializable)
 
 @app.route('/api/analysis/root-cause', methods=['POST'])
 def analyze_root_cause():
@@ -206,10 +272,96 @@ def get_time_series():
     group_by = request.args.get('group_by', 'hour')  # hour, day, week
     
     time_series = data_analyzer.get_time_series(column, start_date, end_date, group_by)
-    return jsonify(time_series)
+    return jsonify(time_series)  
+
+@app.route('/api/dashboard', methods=['GET'])
+def get_dashboard():
+    try:
+        df = pd.read_sql('manufacturing_data', engine)
+
+        if df.empty:
+            return jsonify({'error': 'No data available'}), 400
+
+        # ---------- 基础清洗 ----------
+        df['Date of detection'] = pd.to_datetime(
+            df['Date of detection'], errors='coerce'
+        )
+
+        today = pd.Timestamp.now().normalize()
+        week_ago = today - pd.Timedelta(days=7)
+
+        # ---------- 1. Overview ----------
+        total_ncr = len(df)
+
+        today_ncr = df[df['Date of detection'] >= today].shape[0]
+        week_ncr = df[df['Date of detection'] >= week_ago].shape[0]
+
+        # 超公差判断
+        def is_out_of_tolerance(row):
+            try:
+                return (
+                    row['Measured Value'] < row['Nomial'] + row['FLowerTolerance']
+                    or row['Measured Value'] > row['Nomial'] + row['FUpperTolerance']
+                )
+            except Exception:
+                return False
+
+        df['out_of_tolerance'] = df.apply(is_out_of_tolerance, axis=1)
+        out_ratio = round(df['out_of_tolerance'].mean(), 2)
+
+        overview = {
+            'total_ncr': total_ncr,
+            'today_ncr': int(today_ncr),
+            'week_ncr': int(week_ncr),
+            'out_of_tolerance_ratio': out_ratio
+        }
+
+        # ---------- 2. Distribution ----------
+        distribution = {
+            'by_nc_code': df['NC Code'].value_counts().to_dict(),
+            'by_part_type': df['Part type'].value_counts().to_dict(),
+            'by_machine': df['MachineNum of detection'].value_counts().to_dict()
+        }
+
+        # ---------- 3. Trend ----------
+        trend_df = (
+            df.dropna(subset=['Date of detection'])
+              .groupby(df['Date of detection'].dt.date)
+              .size()
+              .reset_index(name='count')
+        )
+
+        trend = [
+            {'date': str(row['Date of detection']), 'count': int(row['count'])}
+            for _, row in trend_df.iterrows()
+        ]
+
+        # ---------- 4. Quality ----------
+        df['deviation'] = df['Measured Value'] - df['Nomial']
+
+        quality = {
+            'deviation_distribution': df['deviation']
+                .dropna()
+                .round(3)
+                .to_frame(name='deviation')
+                .to_dict(orient='records'),
+            'out_of_tolerance_count': int(df['out_of_tolerance'].sum())
+        }
+
+        return jsonify({
+            'overview': overview,
+            'distribution': distribution,
+            'trend': trend,
+            'quality': quality
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     print("Loading data...")
     load_data()
     print("Data loaded, starting server...")
     app.run(debug=True, host='0.0.0.0', port=5000)
+
+   
