@@ -12,18 +12,26 @@ export default function Dashboard() {
   const [clearing, setClearing] = useState(false)
   const [analyzing, setAnalyzing] = useState(false)
   const [report, setReport] = useState<string | null>(null)
+  const [jobId, setJobId] = useState("")
 
   const handleAnalyze = async () => {
+  if (!jobId) {
+    alert("Please enter a Job Order ID")
+    return
+  }
   try {
     setAnalyzing(true)
     setReport(null)
-    const res = await fetch(`http://localhost:5000/api/analyze`)
-    if (!res.ok) throw new Error("Analysis failed")
+    const res = await fetch(`http://localhost:5000/api/analyze/${jobId}`)
+    if (!res.ok) {
+      const errJson = await res.json()
+      throw new Error(errJson.error || "Analysis failed")
+    }
     const json = await res.json()
     setReport(json.report || "No report returned")
-  } catch (err) {
+  } catch (err: any) {
     console.error(err)
-    alert("Failed to analyze data")
+    alert(err.message || "Failed to analyze data")
   } finally {
     setAnalyzing(false)
   }
@@ -175,6 +183,13 @@ export default function Dashboard() {
           >
             {clearing ? "Clearing..." : "Clear Dashboard Data"}
           </button>
+          <input
+  type="text"
+  placeholder="Job Order ID"
+  className="border px-2 py-1 rounded"
+  value={jobId}
+  onChange={(e) => setJobId(e.target.value)}
+/>
           <button
            onClick={handleAnalyze}
            className="px-4 py-2 rounded bg-green-600 text-white hover:bg-green-700 disabled:opacity-50"
