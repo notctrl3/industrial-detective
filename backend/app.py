@@ -42,6 +42,64 @@ RAG_THRESHOLDS = {
     'defect_count': {'R': 5, 'A': 3}  # >5 红，>3 黄，<=3 绿
 }
 
+def analyze_job_order(target_id, df):
+    from sentence_transformers import SentenceTransformer
+    from sklearn.metrics.pairwise import cosine_similarity
+    import time
+    import dashscope
+    from http import HTTPStatus
+
+    dashscope.api_key = "sk-..."  # 放环境变量更安全
+
+    target_row = df[df['Job order'] == target_id]
+    if target_row.empty:
+        return {"error": f"Job ID '{target_id}' not found"}
+
+    target_row = target_row.iloc[0]
+    query_text = target_row['NC description']
+
+    # RAG 检索
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    embeddings = model.encode(df['NC description'].tolist(), show_progress_bar=False)
+    query_vec = model.encode([query_text])
+    sims = cosine_similarity(query_vec, embeddings)[0]
+    top_indices = sims.argsort()[-4:][::-1]
+
+    history_context = ""
+    source_ids = []
+    for idx in top_indices:
+        row = df.iloc[idx]
+        if row['Job order'] == target_id: continue
+        history_context += f"Case {row['Job order']}: Cause: {row['Root cause of occurrence']}. Fix: {row['Corrective actions']}\n"
+        source_ids.append(row['Job order'])
+
+    # 调用 LLM
+    system_prompt = (
+        "You are a Senior Safran Quality Expert. "
+        "Use the provided historical cases to identify the root cause and corrective action."
+    )
+    user_prompt = f"Problem: {query_text}\n\nEvidence:\n{history_context}"
+    
+    response = dashscope.Generation.call(
+        model='qwen-max',
+        messages=[{'role': 'system', 'content': system_prompt},
+                  {'role': 'user', 'content': user_prompt}],
+        temperature=0.1,
+        result_format='message'
+    )
+
+    if response.status_code == HTTPStatus.OK:
+        report = response.output.choices[0].message.content
+    else:
+        report = f"Error: {response.message} (Status: {response.status_code})"
+
+    return {
+        "job_order": target_id,
+        "report": report,
+        "sources": source_ids,
+        "confidence": round(max(sims)*100, 2)
+    }
+
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -122,6 +180,78 @@ def create_sample_data():
                                       (data['vibration'] > 60).astype(int) * 1)
     
     return pd.DataFrame(data)
+
+@app.route('/api/analyze', methods=['GET'])
+def analyze_all():
+    try:
+        # 从数据库读取所有数据
+        df = pd.read_sql('manufacturing_data', engine)
+        if df.empty:
+            return jsonify({'error': 'No data available'}), 400
+
+        # 假设我们分析最严重的 NCR，定义标准，比如 defect_count 最大
+        df['severity_score'] = df['defect_count'].fillna(0)
+        top_idx = df['severity_score'].idxmax()
+        top_row = df.loc[top_idx]
+
+        # 生成自然语言报告（调用 Safran Sentinel 逻辑）
+        from sentence_transformers import SentenceTransformer
+        from sklearn.metrics.pairwise import cosine_similarity
+        import dashscope
+        from http import HTTPStatus
+
+        dashscope.api_key = "sk-24de7eeaca414ca0a1d7cd4872cf7377"  # 放环境变量更安全
+
+        query_text = str(top_row['NC description']) if pd.notna(top_row['NC description']) else "No description available"
+
+
+        # 语义检索历史案例
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        embeddings = model.encode(df['NC description'].tolist(), show_progress_bar=False)
+        query_vec = model.encode([query_text])
+        sims = cosine_similarity(query_vec, embeddings)[0]
+        top_indices = sims.argsort()[-4:][::-1]
+
+        history_context = ""
+        source_ids = []
+        for idx in top_indices:
+            row = df.iloc[idx]
+            if row.name == top_idx:
+                continue
+            history_context += f"Case {row['Job order']}: Cause: {row['Root cause of occurrence']}. Fix: {row['Corrective actions']}\n"
+            source_ids.append(row['Job order'])
+
+        # 调用 LLM
+        system_prompt = (
+            "You are a Senior Safran Quality Expert. "
+            "Use the provided historical cases to identify the root cause and corrective action."
+        )
+        user_prompt = f"Problem: {query_text}\n\nEvidence:\n{history_context}"
+
+        response = dashscope.Generation.call(
+            model='qwen-max',
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt}
+            ],
+            temperature=0.1,
+            result_format='message'
+        )
+
+        if response.status_code == HTTPStatus.OK:
+            report = response.output.choices[0].message.content
+        else:
+            report = f"Error: {response.message} (Status: {response.status_code})"
+
+        return jsonify({
+            "report": report,
+            "top_job_order": top_row['Job order'],
+            "sources": source_ids,
+            "confidence": round(max(sims)*100, 2)
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/clear-data', methods=['POST'])
 def clear_data():

@@ -10,6 +10,24 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
   const [clearing, setClearing] = useState(false)
+  const [analyzing, setAnalyzing] = useState(false)
+  const [report, setReport] = useState<string | null>(null)
+
+  const handleAnalyze = async () => {
+  try {
+    setAnalyzing(true)
+    setReport(null)
+    const res = await fetch(`http://localhost:5000/api/analyze`)
+    if (!res.ok) throw new Error("Analysis failed")
+    const json = await res.json()
+    setReport(json.report || "No report returned")
+  } catch (err) {
+    console.error(err)
+    alert("Failed to analyze data")
+  } finally {
+    setAnalyzing(false)
+  }
+}
 
   useEffect(() => {
     checkData()
@@ -90,7 +108,6 @@ export default function Dashboard() {
 
   if (loading) return <div className="p-8">Loading dashboard...</div>
 
-  // 没有数据只显示上传
   if (!data) {
     return (
       <div className="p-8 flex flex-col items-start gap-4">
@@ -112,12 +129,26 @@ export default function Dashboard() {
           </button>
         </label>
       </div>
+      
     )
   }
 
-  // 有数据就显示 Dashboard
   return (
     <div className="p-8 space-y-8">
+      {report && (
+  <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+    <div className="bg-white p-6 rounded-lg max-w-lg w-full relative">
+      <button
+        className="absolute top-2 right-2 text-gray-500 hover:text-gray-800"
+        onClick={() => setReport(null)}
+      >
+        ✕
+      </button>
+      <h2 className="text-xl font-bold mb-4">Analysis Report</h2>
+      <pre className="whitespace-pre-wrap">{report}</pre>
+    </div>
+  </div>
+)}
       <div className="flex justify-between items-center">
         <h1 className="text-3xl font-bold">Industrial Detective Dashboard</h1>
         <div className="flex gap-2">
@@ -143,6 +174,13 @@ export default function Dashboard() {
             disabled={clearing}
           >
             {clearing ? "Clearing..." : "Clear Dashboard Data"}
+          </button>
+          <button
+           onClick={handleAnalyze}
+           className="px-4 py-2 rounded bg-green-600 text-white hover:bg-green-700 disabled:opacity-50"
+           disabled={analyzing}
+          >
+            {analyzing ? "Analyzing..." : "Analyze Job Order"}
           </button>
         </div>
       </div>
